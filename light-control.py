@@ -17,10 +17,6 @@ RAVENS_COLOR = (280, 100, 100)
 # Buckeyes Color (Hue 348, Sat 94, Val 73)
 BUCKEYES_COLOR = (348, 94, 73)
 
-# Game Over: Warm White (2700K), Brightness 100%
-NORMAL_TEMP = 2700
-NORMAL_BRIGHTNESS = 100
-
 
 @dataclass(frozen=True)
 class TeamConfig:
@@ -78,28 +74,59 @@ async def turn_on_team_color(team: TeamConfig):
     except Exception as e:
         print(f"[{team.label}] Failed to set team color: {e}")
 
-async def turn_on_normal():
-    """Sets the bulb to warm white and 100% brightness."""
+
+async def capture_bulb_state():
+    """Capture the bulb's current light state so we can restore it later."""
     try:
         bulb = await get_bulb()
-        
-        if Module.Light in bulb.modules:
-            print("Game Over. Resetting light to Normal (2700K, 100%)...")
-            
-            await bulb.turn_on()
-            
-            # Set Color Temp using the new Module syntax
-            await bulb.modules[Module.Light].set_color_temp(
-                NORMAL_TEMP, 
-                brightness=NORMAL_BRIGHTNESS
-            )
-        else:
-            print("Error: Device does not appear to be a light.")
+        await bulb.update()
 
-    except KasaException as e:
-        print(f"Kasa Device Error: {e}")
+        light = bulb.modules.get(Module.Light)
+        if not light:
+            print("Error: Device does not appear to be a light.")
+            return None
+
+        return {
+            "is_on": bulb.is_on,
+            "hsv": getattr(light, "hsv", None),
+            "color_temp": getattr(light, "color_temp", None),
+            "brightness": getattr(light, "brightness", None),
+        }
+
     except Exception as e:
-        print(f"Failed to set Normal: {e}")
+        print(f"Failed to capture bulb state: {e}")
+        return None
+
+
+async def restore_bulb_state(state):
+    """Restore a previously captured bulb state after a game ends."""
+    if not state:
+        print("No saved bulb state to restore.")
+        return
+
+    try:
+        bulb = await get_bulb()
+        light = bulb.modules.get(Module.Light)
+        if not light:
+            print("Error: Device does not appear to be a light.")
+            return
+
+        if state.get("is_on"):
+            await bulb.turn_on()
+
+            if state.get("hsv"):
+                await light.set_hsv(*state["hsv"])
+                if state.get("brightness") is not None:
+                    await light.set_brightness(state["brightness"])
+            elif state.get("color_temp"):
+                await light.set_color_temp(
+                    state["color_temp"], brightness=state.get("brightness")
+                )
+        else:
+            await bulb.turn_off()
+
+    except Exception as e:
+        print(f"Failed to restore bulb state: {e}")
 
 def get_game_info(team: TeamConfig):
     """Fetches the next game schedule and status from ESPN API for the team."""
@@ -262,19 +289,28 @@ async def monitor_team(team: TeamConfig):
                 f"[{team.label}] Waiting {wait_seconds/60:.1f} minutes until kickoff trigger..."
             )
             await asyncio.sleep(wait_seconds)
-            
+
+            saved_state = await capture_bulb_state()
+
             await turn_on_team_color(team)
-            await wait_for_game_end(team, game['id'])
-            await turn_on_normal()
-            
+            try:
+                await wait_for_game_end(team, game['id'])
+            finally:
+                await restore_bulb_state(saved_state)
+
             await asyncio.sleep(3600)
 
         # --- Scenario 2: Game started (or script restarted during game) ---
         elif wait_seconds <= 0 and not game['completed']:
             print(f"[{team.label}] Game in progress! Turning team color immediately.")
+            saved_state = await capture_bulb_state()
+
             await turn_on_team_color(team)
-            await wait_for_game_end(team, game['id'])
-            await turn_on_normal()
+            try:
+                await wait_for_game_end(team, game['id'])
+            finally:
+                await restore_bulb_state(saved_state)
+
             await asyncio.sleep(3600)
 
         # --- Scenario 3: Old game found ---
@@ -283,6 +319,11 @@ async def monitor_team(team: TeamConfig):
             await asyncio.sleep(3600)
 
 async def main():
+#    state = await capture_bulb_state()
+#    print("current state:", state)
+#    await turn_on_team_color(TEAM_CONFIGS[0])
+#    await restore_bulb_state(state)
+
     await asyncio.gather(*(monitor_team(team) for team in TEAM_CONFIGS))
 
 if __name__ == "__main__":
