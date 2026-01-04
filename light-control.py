@@ -4,6 +4,7 @@ import asyncio
 import requests
 import datetime
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 # We import Module to access the new light control system
 from kasa import Module, KasaException
 from kasa.iot import IotBulb
@@ -136,11 +137,13 @@ def get_game_info(team: TeamConfig):
     try:
         data = requests.get(url, timeout=10).json()
         events = data.get('events', [])
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(ZoneInfo('America/New_York'))
 
         for event in events:
             date_str = event.get('date')
             game_time = datetime.datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            # Convert from UTC to Eastern Time
+            game_time = game_time.astimezone(ZoneInfo('America/New_York'))
             
             competitions = event.get('competitions', [])
             if not competitions:
@@ -247,15 +250,15 @@ async def wait_for_game_end(team: TeamConfig, game_id):
                 print(f"[{team.label}] API reports game is FINAL.")
                 return
             
-            period = status.get('type', {}).get('detail', 'In Progress')
-            print(
-                f"[{team.label}] Game status: {period}, Score: {last_score}. Checking again in 30 seconds..."
-            )
+            # period = status.get('type', {}).get('detail', 'In Progress')
+            # print(
+            #     f"[{team.label}] Game status: {period}, Score: {last_score}. Checking again in 10 seconds..."
+            # )
             
         except Exception as e:
             print(f"[{team.label}] Error checking game status: {e}")
         
-        await asyncio.sleep(30)  # Check more frequently for scores
+        await asyncio.sleep(10)  # Check more frequently for scores
 
 async def test_flash(team: TeamConfig = TEAM_CONFIGS[0]):
     bulb = await get_bulb()
@@ -275,13 +278,13 @@ async def monitor_team(team: TeamConfig):
             await asyncio.sleep(86400)
             continue
 
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(ZoneInfo('America/New_York'))
         game_time = game['time']
         trigger_time = game_time - datetime.timedelta(minutes=5)
         wait_seconds = (trigger_time - now).total_seconds()
 
         print(f"[{team.label}] Target Game: {game['name']}")
-        print(f"[{team.label}] Kickoff: {game_time} UTC")
+        print(f"[{team.label}] Kickoff: {game_time.strftime('%Y-%m-%d %H:%M:%S')} ET")
 
         # --- Scenario 1: Game is in the future ---
         if wait_seconds > 0:
