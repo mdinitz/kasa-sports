@@ -19,7 +19,7 @@ RAVENS_COLOR = (280, 100, 100)
 BUCKEYES_COLOR = (348, 94, 73)
 
 # Orioles Color (Hue 15.325 rounded to 15, Sat 92, Val 98)
-ORIOLES_COLOR = (15, 92, 98)
+ORIOLES_COLOR = (8, 92, 87)
 
 
 @dataclass(frozen=True)
