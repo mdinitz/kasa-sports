@@ -18,6 +18,9 @@ RAVENS_COLOR = (280, 100, 100)
 # Buckeyes Color (Hue 348, Sat 94, Val 73)
 BUCKEYES_COLOR = (348, 94, 73)
 
+# Orioles Color (Hue 15.325 rounded to 15, Sat 92, Val 98)
+ORIOLES_COLOR = (15, 92, 98)
+
 
 @dataclass(frozen=True)
 class TeamConfig:
@@ -43,7 +46,57 @@ TEAM_CONFIGS = (
         sport_path="football/college-football",
         color=BUCKEYES_COLOR,
     ),
+    TeamConfig(
+        label="ORIOLES",
+        name="Baltimore Orioles",
+        espn_team_id="1",
+        sport_path="baseball/mlb",
+        color=ORIOLES_COLOR,
+    ),
 )
+
+
+def validate_team_configs():
+    """Validate configured ESPN sport path/team IDs and log warnings for mismatches."""
+    print("[CONFIG] Validating team configurations against ESPN API...")
+
+    for team in TEAM_CONFIGS:
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}"
+        )
+        try:
+            data = requests.get(url, timeout=10).json()
+            api_team = data.get("team", {})
+            api_team_name = api_team.get("displayName")
+            api_team_id = api_team.get("id")
+
+            if not api_team_id or not api_team_name:
+                print(
+                    f"[CONFIG][{team.label}] WARNING: Could not resolve team at {team.sport_path}/teams/{team.espn_team_id}"
+                )
+                continue
+
+            if str(api_team_id) != str(team.espn_team_id):
+                print(
+                    f"[CONFIG][{team.label}] WARNING: Config team id {team.espn_team_id} resolved as {api_team_id} ({api_team_name})"
+                )
+                continue
+
+            configured_name = team.name.strip().lower()
+            resolved_name = api_team_name.strip().lower()
+            if configured_name != resolved_name:
+                print(
+                    f"[CONFIG][{team.label}] WARNING: Config name '{team.name}' differs from ESPN '{api_team_name}'"
+                )
+            else:
+                print(
+                    f"[CONFIG][{team.label}] OK: {api_team_name} ({team.sport_path}/teams/{team.espn_team_id})"
+                )
+
+        except Exception as e:
+            print(
+                f"[CONFIG][{team.label}] WARNING: Validation request failed for {team.sport_path}/teams/{team.espn_team_id}: {e}"
+            )
 
 async def get_bulb():
     """
@@ -131,12 +184,32 @@ async def restore_bulb_state(state):
 
 def get_game_info(team: TeamConfig):
     """Fetches the next game schedule and status from ESPN API for the team."""
-    url = (
-        f"http://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}/schedule"
+    base_url = (
+        f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}/schedule"
     )
+
+    urls = [base_url]
+    if team.sport_path == "baseball/mlb":
+        urls = [
+            f"{base_url}?seasontype=1",  # preseason / spring training
+            f"{base_url}?seasontype=2",  # regular season
+        ]
+
     try:
-        data = requests.get(url, timeout=10).json()
-        events = data.get('events', [])
+        events = []
+        seen_event_ids = set()
+
+        for url in urls:
+            data = requests.get(url, timeout=10).json()
+            for event in data.get('events', []):
+                event_id = event.get('id')
+                if event_id and event_id in seen_event_ids:
+                    continue
+                if event_id:
+                    seen_event_ids.add(event_id)
+                events.append(event)
+
+        events.sort(key=lambda event: event.get('date', ''))
         now = datetime.datetime.now(ZoneInfo('America/New_York'))
 
         for event in events:
@@ -284,12 +357,12 @@ async def monitor_team(team: TeamConfig):
         wait_seconds = (trigger_time - now).total_seconds()
 
         print(f"[{team.label}] Target Game: {game['name']}")
-        print(f"[{team.label}] Kickoff: {game_time.strftime('%Y-%m-%d %H:%M:%S')} ET")
+        print(f"[{team.label}] Start: {game_time.strftime('%Y-%m-%d %H:%M:%S')} ET")
 
         # --- Scenario 1: Game is in the future ---
         if wait_seconds > 0:
             print(
-                f"[{team.label}] Waiting {wait_seconds/60:.1f} minutes until kickoff trigger..."
+                f"[{team.label}] Waiting {wait_seconds/60:.1f} minutes until start trigger..."
             )
             await asyncio.sleep(wait_seconds)
 
@@ -326,6 +399,8 @@ async def main():
 #    print("current state:", state)
 #    await turn_on_team_color(TEAM_CONFIGS[0])
 #    await restore_bulb_state(state)
+
+    validate_team_configs()
 
     await asyncio.gather(*(monitor_team(team) for team in TEAM_CONFIGS))
 

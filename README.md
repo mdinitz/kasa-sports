@@ -1,11 +1,10 @@
 # Kasa Sports Light Control
 
-Script to drive a Kasa smart bulb based on live sports events via the ESPN API. It is currently wired to a single bulb IP and only tracks the Baltimore Ravens and Ohio State Buckeyes.
+Script to drive a Kasa smart bulb based on live sports events via the ESPN API. It is currently wired to a single bulb IP and tracks the Baltimore Ravens, Ohio State Buckeyes, and Baltimore Orioles.
 
 ## What it does
 - Polls the ESPN schedule/summary endpoints for each configured team.
-- Before kickoff, turns the bulb to the team color (Ravens purple, Buckeyes scarlet).
- - Before kickoff, turns the bulb to the team color (Ravens purple, Buckeyes scarlet).
+- Before game start, turns the bulb to the team color (Ravens purple, Buckeyes scarlet, Orioles orange).
  - Flashes the light for scoring events, then restores the bulb to its previous settings when the game is final (instead of forcing a warm white).
  - Runs both teams concurrently with `asyncio`.
 
@@ -16,7 +15,7 @@ Script to drive a Kasa smart bulb based on live sports events via the ESPN API. 
 
 ## Configuration
 - Bulb IP: update `BULB_IP` in `light-control.py` to your bulb's address (currently `192.168.1.222`).
-- Teams: edit `TEAM_CONFIGS` to change or add teams; the script ships with only the Ravens and Buckeyes.
+- Teams: edit `TEAM_CONFIGS` to change or add teams; the script ships with Ravens, Buckeyes, and Orioles.
 - Colors/behavior: team HSV values are defined at the top of the script.
 
 ## Running
