@@ -11,6 +11,7 @@ from kasa.iot import IotBulb
 
 # --- Configuration ---
 BULB_IP = "192.168.1.222"
+WARM_WHITE_COLOR_TEMP = 2700
 
 # Game On: Purple (Hue 280, Sat 100, Val 100)
 RAVENS_COLOR = (280, 100, 100) 
@@ -177,6 +178,8 @@ async def restore_bulb_state(state):
                     state["color_temp"], brightness=state.get("brightness")
                 )
         else:
+            await bulb.turn_on()
+            await light.set_color_temp(WARM_WHITE_COLOR_TEMP)
             await bulb.turn_off()
 
     except Exception as e:
