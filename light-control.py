@@ -4,6 +4,7 @@ import asyncio
 import requests
 import datetime
 from dataclasses import dataclass
+from typing import Optional
 from zoneinfo import ZoneInfo
 # We import Module to access the new light control system
 from kasa import Module, KasaException
@@ -22,20 +23,29 @@ BUCKEYES_COLOR = (348, 94, 73)
 # Orioles Color (Hue 15.325 rounded to 15, Sat 92, Val 98)
 ORIOLES_COLOR = (8, 92, 87)
 
+ESPN_PROVIDER = "espn"
+MLB_PROVIDER = "mlb"
+
+MLB_SPORT_ID = 1
+MLB_GAME_TYPES = ("S", "R", "F", "D", "L", "W")
+
 
 @dataclass(frozen=True)
 class TeamConfig:
     label: str
     name: str
-    espn_team_id: str
-    sport_path: str 
+    provider: str
     color: tuple
+    espn_team_id: Optional[str] = None
+    sport_path: Optional[str] = None
+    mlb_team_id: Optional[int] = None
 
 
 TEAM_CONFIGS = (
     TeamConfig(
         label="RAVENS",
         name="Baltimore Ravens",
+        provider=ESPN_PROVIDER,
         espn_team_id="33",
         sport_path="football/nfl",
         color=RAVENS_COLOR,
@@ -43,6 +53,7 @@ TEAM_CONFIGS = (
     TeamConfig(
         label="BUCKEYES",
         name="Ohio State Buckeyes",
+        provider=ESPN_PROVIDER,
         espn_team_id="194",
         sport_path="football/college-football",
         color=BUCKEYES_COLOR,
@@ -50,54 +61,105 @@ TEAM_CONFIGS = (
     TeamConfig(
         label="ORIOLES",
         name="Baltimore Orioles",
-        espn_team_id="1",
-        sport_path="baseball/mlb",
+        provider=MLB_PROVIDER,
+        mlb_team_id=110,
         color=ORIOLES_COLOR,
     ),
 )
 
 
 def validate_team_configs():
-    """Validate configured ESPN sport path/team IDs and log warnings for mismatches."""
-    print("[CONFIG] Validating team configurations against ESPN API...")
+    """Validate configured team IDs and log warnings for mismatches."""
+    print("[CONFIG] Validating team configurations...")
 
     for team in TEAM_CONFIGS:
-        url = (
-            f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}"
-        )
-        try:
-            data = requests.get(url, timeout=10).json()
-            api_team = data.get("team", {})
-            api_team_name = api_team.get("displayName")
-            api_team_id = api_team.get("id")
+        if team.provider == ESPN_PROVIDER:
+            validate_espn_team_config(team)
+        elif team.provider == MLB_PROVIDER:
+            validate_mlb_team_config(team)
+        else:
+            print(f"[CONFIG][{team.label}] WARNING: Unknown provider '{team.provider}'")
 
-            if not api_team_id or not api_team_name:
-                print(
-                    f"[CONFIG][{team.label}] WARNING: Could not resolve team at {team.sport_path}/teams/{team.espn_team_id}"
-                )
-                continue
 
-            if str(api_team_id) != str(team.espn_team_id):
-                print(
-                    f"[CONFIG][{team.label}] WARNING: Config team id {team.espn_team_id} resolved as {api_team_id} ({api_team_name})"
-                )
-                continue
+def validate_espn_team_config(team: TeamConfig):
+    url = (
+        f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}"
+    )
+    try:
+        data = requests.get(url, timeout=10).json()
+        api_team = data.get("team", {})
+        api_team_name = api_team.get("displayName")
+        api_team_id = api_team.get("id")
 
-            configured_name = team.name.strip().lower()
-            resolved_name = api_team_name.strip().lower()
-            if configured_name != resolved_name:
-                print(
-                    f"[CONFIG][{team.label}] WARNING: Config name '{team.name}' differs from ESPN '{api_team_name}'"
-                )
-            else:
-                print(
-                    f"[CONFIG][{team.label}] OK: {api_team_name} ({team.sport_path}/teams/{team.espn_team_id})"
-                )
-
-        except Exception as e:
+        if not api_team_id or not api_team_name:
             print(
-                f"[CONFIG][{team.label}] WARNING: Validation request failed for {team.sport_path}/teams/{team.espn_team_id}: {e}"
+                f"[CONFIG][{team.label}] WARNING: Could not resolve team at {team.sport_path}/teams/{team.espn_team_id}"
             )
+            return
+
+        if str(api_team_id) != str(team.espn_team_id):
+            print(
+                f"[CONFIG][{team.label}] WARNING: Config team id {team.espn_team_id} resolved as {api_team_id} ({api_team_name})"
+            )
+            return
+
+        configured_name = team.name.strip().lower()
+        resolved_name = api_team_name.strip().lower()
+        if configured_name != resolved_name:
+            print(
+                f"[CONFIG][{team.label}] WARNING: Config name '{team.name}' differs from ESPN '{api_team_name}'"
+            )
+        else:
+            print(
+                f"[CONFIG][{team.label}] OK: {api_team_name} ({team.sport_path}/teams/{team.espn_team_id})"
+            )
+
+    except Exception as e:
+        print(
+            f"[CONFIG][{team.label}] WARNING: Validation request failed for {team.sport_path}/teams/{team.espn_team_id}: {e}"
+        )
+
+
+def validate_mlb_team_config(team: TeamConfig):
+    if team.mlb_team_id is None:
+        print(f"[CONFIG][{team.label}] WARNING: No MLB team id configured.")
+        return
+
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team.mlb_team_id}?sportId={MLB_SPORT_ID}"
+    try:
+        data = requests.get(url, timeout=10).json()
+        teams = data.get("teams", [])
+        if not teams:
+            print(
+                f"[CONFIG][{team.label}] WARNING: Could not resolve MLB team id {team.mlb_team_id}"
+            )
+            return
+
+        api_team = teams[0]
+        api_team_name = api_team.get("name")
+        api_team_id = api_team.get("id")
+
+        if int(api_team_id) != int(team.mlb_team_id):
+            print(
+                f"[CONFIG][{team.label}] WARNING: Config team id {team.mlb_team_id} resolved as {api_team_id} ({api_team_name})"
+            )
+            return
+
+        configured_name = team.name.strip().lower()
+        resolved_name = str(api_team_name).strip().lower()
+        if configured_name != resolved_name:
+            print(
+                f"[CONFIG][{team.label}] WARNING: Config name '{team.name}' differs from MLB '{api_team_name}'"
+            )
+        else:
+            print(
+                f"[CONFIG][{team.label}] OK: {api_team_name} (MLB teamId={team.mlb_team_id})"
+            )
+
+    except Exception as e:
+        print(
+            f"[CONFIG][{team.label}] WARNING: Validation request failed for MLB team id {team.mlb_team_id}: {e}"
+        )
 
 async def get_bulb():
     """
@@ -186,6 +248,14 @@ async def restore_bulb_state(state):
         print(f"Failed to restore bulb state: {e}")
 
 def get_game_info(team: TeamConfig):
+    """Fetch the next relevant game for the configured team."""
+    if team.provider == MLB_PROVIDER:
+        return get_mlb_game_info(team)
+    else:
+        return get_espn_game_info(team)
+
+
+def get_espn_game_info(team: TeamConfig):
     """Fetches the next game schedule and status from ESPN API for the team."""
     base_url = (
         f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}/schedule"
@@ -242,6 +312,62 @@ def get_game_info(team: TeamConfig):
     
     return None
 
+
+def get_mlb_game_info(team: TeamConfig):
+    """Fetches the next Orioles game from MLB Stats API."""
+    if team.mlb_team_id is None:
+        print(f"[{team.label}] No MLB team id configured.")
+        return None
+
+    today = datetime.datetime.now(ZoneInfo("America/New_York")).date()
+    url = (
+        "https://statsapi.mlb.com/api/v1/schedule"
+        f"?sportId={MLB_SPORT_ID}"
+        f"&teamId={team.mlb_team_id}"
+        f"&startDate={today.isoformat()}"
+        f"&endDate={(today + datetime.timedelta(days=14)).isoformat()}"
+        f"&gameTypes={','.join(MLB_GAME_TYPES)}"
+    )
+
+    try:
+        data = requests.get(url, timeout=10).json()
+        games = []
+        for date_entry in data.get("dates", []):
+            games.extend(date_entry.get("games", []))
+
+        now = datetime.datetime.now(ZoneInfo("America/New_York"))
+        games.sort(key=lambda game: game.get("gameDate", ""))
+
+        for game in games:
+            date_str = game.get("gameDate")
+            if not date_str:
+                continue
+
+            game_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            game_time = game_time.astimezone(ZoneInfo("America/New_York"))
+
+            status = game.get("status", {})
+            detailed_state = status.get("detailedState", "Unknown")
+            is_complete = status.get("abstractGameState") == "Final"
+            game_id = game.get("gamePk")
+            teams = game.get("teams", {})
+            away_name = teams.get("away", {}).get("team", {}).get("name", "Away")
+            home_name = teams.get("home", {}).get("team", {}).get("name", "Home")
+
+            if game_time > now - datetime.timedelta(hours=6):
+                return {
+                    "time": game_time,
+                    "name": f"{away_name} at {home_name}",
+                    "id": str(game_id),
+                    "completed": is_complete,
+                    "status": detailed_state,
+                }
+
+    except Exception as e:
+        print(f"[{team.label}] Error fetching MLB schedule: {e}")
+
+    return None
+
 async def flash_score(bulb, points, team: TeamConfig):
     """Flash the light to indicate a score.
     
@@ -283,7 +409,16 @@ async def flash_score(bulb, points, team: TeamConfig):
 async def wait_for_game_end(team: TeamConfig, game_id):
     """Polls the API to monitor game status and scores."""
     print(f"[{team.label}] Monitoring game {game_id}...")
-    
+
+    if team.provider == MLB_PROVIDER:
+        await wait_for_mlb_game_end(team, game_id)
+        return
+
+    await wait_for_espn_game_end(team, game_id)
+
+
+async def wait_for_espn_game_end(team: TeamConfig, game_id):
+    """Poll the ESPN summary endpoint for live game status and score changes."""
     url = (
         f"http://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/summary?event={game_id}"
     )
@@ -335,6 +470,86 @@ async def wait_for_game_end(team: TeamConfig, game_id):
             print(f"[{team.label}] Error checking game status: {e}")
         
         await asyncio.sleep(10)  # Check more frequently for scores
+
+
+def get_mlb_team_side(feed_data, team: TeamConfig):
+    if team.mlb_team_id is None:
+        return None
+
+    teams = feed_data.get("gameData", {}).get("teams", {})
+    for side in ("away", "home"):
+        side_data = teams.get(side, {})
+        if side_data.get("id") == team.mlb_team_id:
+            return side
+
+    return None
+
+
+def get_mlb_team_score(feed_data, team: TeamConfig):
+    if team.mlb_team_id is None:
+        return 0
+
+    team_side = get_mlb_team_side(feed_data, team)
+    if not team_side:
+        return 0
+
+    linescore_teams = feed_data.get("liveData", {}).get("linescore", {}).get("teams", {})
+    side_linescore = linescore_teams.get(team_side, {})
+    if "runs" in side_linescore:
+        return int(side_linescore.get("runs") or 0)
+
+    boxscore_teams = feed_data.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    side_boxscore = boxscore_teams.get(team_side, {})
+    team_stats = side_boxscore.get("teamStats", {}).get("batting", {})
+    if "runs" in team_stats:
+        return int(team_stats.get("runs") or 0)
+
+    return 0
+
+
+def is_mlb_game_complete(feed_data):
+    status = feed_data.get("gameData", {}).get("status", {})
+    abstract_state = status.get("abstractGameState")
+    coded_state = status.get("codedGameState")
+    return abstract_state == "Final" or coded_state == "F"
+
+
+async def wait_for_mlb_game_end(team: TeamConfig, game_id):
+    """Poll the MLB live feed for Orioles score changes and game completion."""
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
+    last_score = None
+    bulb = None
+
+    try:
+        bulb = await get_bulb()
+    except Exception as e:
+        print(f"Could not connect to bulb: {e}")
+
+    while True:
+        try:
+            data = requests.get(url, timeout=10).json()
+            current_score = get_mlb_team_score(data, team)
+            if last_score is None:
+                last_score = current_score
+                print(
+                    f"[{team.label}] MLB live feed attached at current score {current_score}."
+                )
+            elif current_score > last_score:
+                runs_scored = current_score - last_score
+                print(
+                    f"[{team.label}] Scored {runs_scored} run(s)! New score: {current_score}"
+                )
+                await flash_score(bulb, runs_scored, team)
+                last_score = current_score
+
+            if is_mlb_game_complete(data):
+                print(f"[{team.label}] MLB API reports game is FINAL.")
+                return
+
+        except Exception as e:
+            print(f"[{team.label}] Error checking MLB game status: {e}")
+
+        await asyncio.sleep(10)
 
 async def test_flash(team: TeamConfig = TEAM_CONFIGS[0]):
     bulb = await get_bulb()
