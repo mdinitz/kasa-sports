@@ -6,7 +6,8 @@ Script to drive a Kasa smart bulb based on live sports events. It is currently w
 - Polls ESPN for Ravens and Buckeyes schedule/live-score updates.
 - Polls the MLB Stats API for Orioles schedule/live-score updates.
 - Before game start, turns the bulb to the team color (Ravens purple, Buckeyes scarlet, Orioles orange).
- - Flashes the light for scoring events, then restores the bulb to its previous settings when the game is final (instead of forcing a warm white).
+ - Flashes the light for scoring events, then sets the bulb to soft white (2500K) when the game is final.
+ - Uses 5% brightness after sunset and 50% brightness before sunset for the post-game soft white state.
  - Runs both teams concurrently with `asyncio`.
 
 ## Requirements
@@ -16,6 +17,7 @@ Script to drive a Kasa smart bulb based on live sports events. It is currently w
 
 ## Configuration
 - Bulb IP: update `BULB_IP` in `light-control.py` to your bulb's address (currently `192.168.1.222`).
+- Sunset location: update `LOCATION_LATITUDE` and `LOCATION_LONGITUDE` in `light-control.py` if the bulb is not in the Baltimore area.
 - Teams: edit `TEAM_CONFIGS` to change or add teams; the script ships with Ravens, Buckeyes, and Orioles.
 - Providers: Ravens and Buckeyes use ESPN team IDs and sport paths; Orioles use the MLB Stats API with MLB team ID `110`.
 - Colors/behavior: team HSV values are defined at the top of the script.

@@ -3,6 +3,7 @@
 import asyncio
 import requests
 import datetime
+import math
 from dataclasses import dataclass
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -12,7 +13,12 @@ from kasa.iot import IotBulb
 
 # --- Configuration ---
 BULB_IP = "192.168.1.222"
-WARM_WHITE_COLOR_TEMP = 2700
+WARM_WHITE_COLOR_TEMP = 2500
+POST_GAME_BRIGHTNESS_AFTER_SUNSET = 5
+POST_GAME_BRIGHTNESS_BEFORE_SUNSET = 50
+LOCATION_LATITUDE = 39.2904
+LOCATION_LONGITUDE = -76.6122
+LOCAL_TIMEZONE = ZoneInfo("America/New_York")
 
 # Game On: Purple (Hue 280, Sat 100, Val 100)
 RAVENS_COLOR = (280, 100, 100) 
@@ -66,6 +72,76 @@ TEAM_CONFIGS = (
         color=ORIOLES_COLOR,
     ),
 )
+
+
+def normalize_degrees(angle):
+    return angle % 360
+
+
+def calculate_sunset(target_date: datetime.date):
+    """Calculate local sunset time using the NOAA solar calculation."""
+    day_of_year = target_date.timetuple().tm_yday
+    longitude_hour = LOCATION_LONGITUDE / 15
+
+    approximate_time = day_of_year + ((18 - longitude_hour) / 24)
+    mean_anomaly = (0.9856 * approximate_time) - 3.289
+
+    true_longitude = mean_anomaly + (
+        1.916 * math.sin(math.radians(mean_anomaly))
+    ) + (
+        0.020 * math.sin(math.radians(2 * mean_anomaly))
+    ) + 282.634
+    true_longitude = normalize_degrees(true_longitude)
+
+    right_ascension = math.degrees(
+        math.atan(0.91764 * math.tan(math.radians(true_longitude)))
+    )
+    right_ascension = normalize_degrees(right_ascension)
+
+    true_longitude_quadrant = math.floor(true_longitude / 90) * 90
+    right_ascension_quadrant = math.floor(right_ascension / 90) * 90
+    right_ascension += true_longitude_quadrant - right_ascension_quadrant
+    right_ascension /= 15
+
+    sin_declination = 0.39782 * math.sin(math.radians(true_longitude))
+    cos_declination = math.cos(math.asin(sin_declination))
+
+    cos_local_hour_angle = (
+        math.cos(math.radians(90.833))
+        - (math.sin(math.radians(LOCATION_LATITUDE)) * sin_declination)
+    ) / (math.cos(math.radians(LOCATION_LATITUDE)) * cos_declination)
+
+    if cos_local_hour_angle <= -1 or cos_local_hour_angle >= 1:
+        return datetime.datetime.combine(
+            target_date,
+            datetime.time(hour=18, minute=0),
+            tzinfo=LOCAL_TIMEZONE,
+        )
+
+    local_hour_angle = math.degrees(math.acos(cos_local_hour_angle)) / 15
+    local_mean_time = (
+        local_hour_angle + right_ascension - (0.06571 * approximate_time) - 6.622
+    )
+
+    utc_hour = (local_mean_time - longitude_hour) % 24
+    utc_midnight = datetime.datetime.combine(
+        target_date,
+        datetime.time.min,
+        tzinfo=datetime.timezone.utc,
+    )
+    sunset_utc = utc_midnight + datetime.timedelta(hours=utc_hour)
+    return sunset_utc.astimezone(LOCAL_TIMEZONE)
+
+
+def get_post_game_brightness(now=None):
+    """Choose the post-game brightness based on whether sunset has passed."""
+    current_time = now or datetime.datetime.now(LOCAL_TIMEZONE)
+    sunset = calculate_sunset(current_time.date())
+
+    if current_time >= sunset:
+        return POST_GAME_BRIGHTNESS_AFTER_SUNSET, sunset
+
+    return POST_GAME_BRIGHTNESS_BEFORE_SUNSET, sunset
 
 
 def validate_team_configs():
@@ -192,34 +268,9 @@ async def turn_on_team_color(team: TeamConfig):
         print(f"[{team.label}] Failed to set team color: {e}")
 
 
-async def capture_bulb_state():
-    """Capture the bulb's current light state so we can restore it later."""
-    try:
-        bulb = await get_bulb()
-        await bulb.update()
-
-        light = bulb.modules.get(Module.Light)
-        if not light:
-            print("Error: Device does not appear to be a light.")
-            return None
-
-        return {
-            "is_on": bulb.is_on,
-            "hsv": getattr(light, "hsv", None),
-            "color_temp": getattr(light, "color_temp", None),
-            "brightness": getattr(light, "brightness", None),
-        }
-
-    except Exception as e:
-        print(f"Failed to capture bulb state: {e}")
-        return None
-
-
-async def restore_bulb_state(state):
-    """Restore a previously captured bulb state after a game ends."""
-    if not state:
-        print("No saved bulb state to restore.")
-        return
+async def set_post_game_light(team: TeamConfig):
+    """Set the bulb to soft white after a game ends, with sunset-based brightness."""
+    brightness, sunset = get_post_game_brightness()
 
     try:
         bulb = await get_bulb()
@@ -228,24 +279,15 @@ async def restore_bulb_state(state):
             print("Error: Device does not appear to be a light.")
             return
 
-        if state.get("is_on"):
-            await bulb.turn_on()
-
-            if state.get("hsv"):
-                await light.set_hsv(*state["hsv"])
-                if state.get("brightness") is not None:
-                    await light.set_brightness(state["brightness"])
-            elif state.get("color_temp"):
-                await light.set_color_temp(
-                    state["color_temp"], brightness=state.get("brightness")
-                )
-        else:
-            await bulb.turn_on()
-            await light.set_color_temp(WARM_WHITE_COLOR_TEMP)
-            await bulb.turn_off()
+        await bulb.turn_on()
+        await light.set_color_temp(WARM_WHITE_COLOR_TEMP, brightness=brightness)
+        print(
+            f"[{team.label}] Post-game light set to soft white at {brightness}% brightness "
+            f"(sunset: {sunset.strftime('%Y-%m-%d %H:%M:%S')} ET)."
+        )
 
     except Exception as e:
-        print(f"Failed to restore bulb state: {e}")
+        print(f"[{team.label}] Failed to set post-game light: {e}")
 
 def get_game_info(team: TeamConfig):
     """Fetch the next relevant game for the configured team."""
@@ -584,26 +626,23 @@ async def monitor_team(team: TeamConfig):
             )
             await asyncio.sleep(wait_seconds)
 
-            saved_state = await capture_bulb_state()
-
             await turn_on_team_color(team)
             try:
                 await wait_for_game_end(team, game['id'])
             finally:
-                await restore_bulb_state(saved_state)
+                await set_post_game_light(team)
 
             await asyncio.sleep(3600)
 
         # --- Scenario 2: Game started (or script restarted during game) ---
         elif wait_seconds <= 0 and not game['completed']:
             print(f"[{team.label}] Game in progress! Turning team color immediately.")
-            saved_state = await capture_bulb_state()
 
             await turn_on_team_color(team)
             try:
                 await wait_for_game_end(team, game['id'])
             finally:
-                await restore_bulb_state(saved_state)
+                await set_post_game_light(team)
 
             await asyncio.sleep(3600)
 
@@ -613,10 +652,8 @@ async def monitor_team(team: TeamConfig):
             await asyncio.sleep(3600)
 
 async def main():
-#    state = await capture_bulb_state()
-#    print("current state:", state)
 #    await turn_on_team_color(TEAM_CONFIGS[0])
-#    await restore_bulb_state(state)
+#    await set_post_game_light(TEAM_CONFIGS[0])
 
     validate_team_configs()
 
