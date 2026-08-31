@@ -303,12 +303,11 @@ def get_espn_game_info(team: TeamConfig):
         f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}/schedule"
     )
 
-    urls = [base_url]
-    if team.sport_path == "baseball/mlb":
-        urls = [
-            f"{base_url}?seasontype=1",  # preseason / spring training
-            f"{base_url}?seasontype=2",  # regular season
-        ]
+    urls = [
+        f"{base_url}?seasontype=1",  # preseason
+        f"{base_url}?seasontype=2",  # regular season
+        f"{base_url}?seasontype=3",  # postseason / playoffs / bowl games
+    ]
 
     try:
         events = []
