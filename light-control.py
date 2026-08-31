@@ -1,13 +1,12 @@
 #!/home/mdinitz/mykasaenv/bin/python3
 
 import asyncio
-import requests
 import datetime
 import math
 from dataclasses import dataclass
 from typing import Optional
 from zoneinfo import ZoneInfo
-# We import Module to access the new light control system
+import requests
 from kasa import Module, KasaException
 from kasa.iot import IotBulb
 
@@ -19,9 +18,10 @@ POST_GAME_BRIGHTNESS_BEFORE_SUNSET = 50
 LOCATION_LATITUDE = 39.2904
 LOCATION_LONGITUDE = -76.6122
 LOCAL_TIMEZONE = ZoneInfo("America/New_York")
+MAX_SCHEDULE_SLEEP_SECONDS = 7200
 
 # Game On: Purple (Hue 280, Sat 100, Val 100)
-RAVENS_COLOR = (280, 100, 100) 
+RAVENS_COLOR = (280, 100, 100)
 
 # Buckeyes Color (Hue 348, Sat 94, Val 73)
 BUCKEYES_COLOR = (348, 94, 73)
@@ -35,6 +35,10 @@ MLB_PROVIDER = "mlb"
 MLB_SPORT_ID = 1
 MLB_GAME_TYPES = ("S", "R", "F", "D", "L", "W")
 
+HTTP_SESSION = requests.Session()
+HTTP_TIMEOUT = 10
+BULB_LOCK = asyncio.Lock()
+
 
 @dataclass(frozen=True)
 class TeamConfig:
@@ -45,6 +49,15 @@ class TeamConfig:
     espn_team_id: Optional[str] = None
     sport_path: Optional[str] = None
     mlb_team_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class Game:
+    id: str
+    name: str
+    time: datetime.datetime
+    completed: bool
+    status: str = ""
 
 
 TEAM_CONFIGS = (
@@ -144,6 +157,18 @@ def get_post_game_brightness(now=None):
     return POST_GAME_BRIGHTNESS_BEFORE_SUNSET, sunset
 
 
+def fetch_json_sync(url: str) -> dict:
+    """Fetch JSON synchronously with configured timeouts."""
+    response = HTTP_SESSION.get(url, timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+async def fetch_json(url: str) -> dict:
+    """Fetch JSON asynchronously via thread pool to keep the event loop unblocked."""
+    return await asyncio.to_thread(fetch_json_sync, url)
+
+
 def validate_team_configs():
     """Validate configured team IDs and log warnings for mismatches."""
     print("[CONFIG] Validating team configurations...")
@@ -162,7 +187,7 @@ def validate_espn_team_config(team: TeamConfig):
         f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}"
     )
     try:
-        data = requests.get(url, timeout=10).json()
+        data = fetch_json_sync(url)
         api_team = data.get("team", {})
         api_team_name = api_team.get("displayName")
         api_team_id = api_team.get("id")
@@ -203,7 +228,7 @@ def validate_mlb_team_config(team: TeamConfig):
 
     url = f"https://statsapi.mlb.com/api/v1/teams/{team.mlb_team_id}?sportId={MLB_SPORT_ID}"
     try:
-        data = requests.get(url, timeout=10).json()
+        data = fetch_json_sync(url)
         teams = data.get("teams", [])
         if not teams:
             print(
@@ -237,76 +262,104 @@ def validate_mlb_team_config(team: TeamConfig):
             f"[CONFIG][{team.label}] WARNING: Validation request failed for MLB team id {team.mlb_team_id}: {e}"
         )
 
+
 async def get_bulb():
-    """
-    Connects directly to the bulb using the modern IotBulb class.
-    """
+    """Connects directly to the bulb using the modern IotBulb class."""
     bulb = IotBulb(BULB_IP)
     await bulb.update()
     return bulb
 
+
 async def turn_on_team_color(team: TeamConfig):
     """Connects to the bulb, turns it on, and sets it to the team color."""
-    try:
-        bulb = await get_bulb()
-        
-        # Check if the device actually has a Light module (Safety check)
-        if Module.Light in bulb.modules:
-            print(f"[{team.label}] Game Time! Setting color at {BULB_IP}...")
-            
-            # 1. Turn On
-            await bulb.turn_on()
-            
-            # 2. Set Color using the new Module syntax
-            await bulb.modules[Module.Light].set_hsv(*team.color)
-        else:
-            print("Error: Device does not appear to be a light.")
-            
-    except KasaException as e:
-        print(f"[{team.label}] Kasa Device Error: {e}")
-    except Exception as e:
-        print(f"[{team.label}] Failed to set team color: {e}")
+    async with BULB_LOCK:
+        try:
+            bulb = await get_bulb()
+            if Module.Light in bulb.modules:
+                print(f"[{team.label}] Game Time! Setting color at {BULB_IP}...")
+                await bulb.turn_on()
+                await bulb.modules[Module.Light].set_hsv(*team.color)
+            else:
+                print(f"[{team.label}] Error: Device does not appear to be a light.")
+        except KasaException as e:
+            print(f"[{team.label}] Kasa Device Error: {e}")
+        except Exception as e:
+            print(f"[{team.label}] Failed to set team color: {e}")
 
 
 async def set_post_game_light(team: TeamConfig):
     """Set the bulb to soft white after a game ends, with sunset-based brightness."""
     brightness, sunset = get_post_game_brightness()
+    async with BULB_LOCK:
+        try:
+            bulb = await get_bulb()
+            light = bulb.modules.get(Module.Light)
+            if not light:
+                print(f"[{team.label}] Error: Device does not appear to be a light.")
+                return
 
-    try:
-        bulb = await get_bulb()
-        light = bulb.modules.get(Module.Light)
-        if not light:
-            print("Error: Device does not appear to be a light.")
-            return
+            await bulb.turn_on()
+            await light.set_color_temp(WARM_WHITE_COLOR_TEMP, brightness=brightness)
+            print(
+                f"[{team.label}] Post-game light set to soft white at {brightness}% brightness "
+                f"(sunset: {sunset.strftime('%Y-%m-%d %H:%M:%S')} ET)."
+            )
+        except Exception as e:
+            print(f"[{team.label}] Failed to set post-game light: {e}")
 
-        await bulb.turn_on()
-        await light.set_color_temp(WARM_WHITE_COLOR_TEMP, brightness=brightness)
-        print(
-            f"[{team.label}] Post-game light set to soft white at {brightness}% brightness "
-            f"(sunset: {sunset.strftime('%Y-%m-%d %H:%M:%S')} ET)."
-        )
 
-    except Exception as e:
-        print(f"[{team.label}] Failed to set post-game light: {e}")
+async def flash_score(points: int, team: TeamConfig, bulb=None):
+    """Flash the light to indicate a score.
 
-def get_game_info(team: TeamConfig):
+    Args:
+        points: Number of points/runs scored
+        team: The team configuration
+        bulb: Optional existing Kasa bulb instance (re-acquired if None)
+    """
+    if points <= 0:
+        return
+
+    async with BULB_LOCK:
+        try:
+            if bulb is None:
+                bulb = await get_bulb()
+            else:
+                await bulb.update()
+
+            light_module = bulb.modules.get(Module.Light)
+            if not light_module:
+                print(f"[{team.label}] No light module found")
+                return
+
+            for _ in range(points):
+                await bulb.turn_off()
+                await asyncio.sleep(0.5)
+                await bulb.turn_on()
+                await asyncio.sleep(0.5)
+
+            # Ensure team color is restored after flash sequence
+            await light_module.set_hsv(*team.color)
+
+        except Exception as e:
+            print(f"[{team.label}] Error during flash sequence: {e}")
+
+
+async def get_game_info(team: TeamConfig) -> Optional[Game]:
     """Fetch the next relevant game for the configured team."""
     if team.provider == MLB_PROVIDER:
-        return get_mlb_game_info(team)
-    else:
-        return get_espn_game_info(team)
+        return await get_mlb_game_info(team)
+    return await get_espn_game_info(team)
 
 
-def get_espn_game_info(team: TeamConfig):
+async def get_espn_game_info(team: TeamConfig) -> Optional[Game]:
     """Fetches the next game schedule and status from ESPN API for the team."""
     base_url = (
         f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/teams/{team.espn_team_id}/schedule"
     )
-
     urls = [
-        f"{base_url}?seasontype=1",  # preseason
-        f"{base_url}?seasontype=2",  # regular season
-        f"{base_url}?seasontype=3",  # postseason / playoffs / bowl games
+        f"{base_url}?seasontype=1",  # Preseason
+        f"{base_url}?seasontype=2",  # Regular season
+        f"{base_url}?seasontype=3",  # Postseason / playoffs / bowl games
     ]
 
     try:
@@ -314,53 +367,58 @@ def get_espn_game_info(team: TeamConfig):
         seen_event_ids = set()
 
         for url in urls:
-            data = requests.get(url, timeout=10).json()
-            for event in data.get('events', []):
-                event_id = event.get('id')
-                if event_id and event_id in seen_event_ids:
-                    continue
-                if event_id:
-                    seen_event_ids.add(event_id)
-                events.append(event)
+            try:
+                data = await fetch_json(url)
+                for event in data.get("events", []):
+                    event_id = event.get("id")
+                    if event_id and event_id in seen_event_ids:
+                        continue
+                    if event_id:
+                        seen_event_ids.add(event_id)
+                    events.append(event)
+            except Exception as e:
+                print(f"[{team.label}] Warning fetching schedule from {url}: {e}")
 
-        events.sort(key=lambda event: event.get('date', ''))
-        now = datetime.datetime.now(ZoneInfo('America/New_York'))
+        events.sort(key=lambda event: event.get("date", ""))
+        now = datetime.datetime.now(LOCAL_TIMEZONE)
 
         for event in events:
-            date_str = event.get('date')
-            game_time = datetime.datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            # Convert from UTC to Eastern Time
-            game_time = game_time.astimezone(ZoneInfo('America/New_York'))
-            
-            competitions = event.get('competitions', [])
+            date_str = event.get("date")
+            if not date_str:
+                continue
+
+            game_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            game_time = game_time.astimezone(LOCAL_TIMEZONE)
+
+            competitions = event.get("competitions", [])
             if not competitions:
                 continue
-                
-            status = competitions[0].get('status', {})
-            is_complete = status.get('type', {}).get('completed', False)
-            game_id = event.get('id')
+
+            status = competitions[0].get("status", {})
+            is_complete = status.get("type", {}).get("completed", False)
+            game_id = str(event.get("id", ""))
 
             if game_time > now - datetime.timedelta(hours=6):
-                return {
-                    'time': game_time,
-                    'name': event.get('name', 'Unknown Game'),
-                    'id': game_id,
-                    'completed': is_complete
-                }
-                
+                return Game(
+                    id=game_id,
+                    name=event.get("name", "Unknown Game"),
+                    time=game_time,
+                    completed=is_complete,
+                )
+
     except Exception as e:
-        print(f"[{team.label}] Error fetching schedule: {e}")
-    
+        print(f"[{team.label}] Error fetching ESPN schedule: {e}")
+
     return None
 
 
-def get_mlb_game_info(team: TeamConfig):
+async def get_mlb_game_info(team: TeamConfig) -> Optional[Game]:
     """Fetches the next Orioles game from MLB Stats API."""
     if team.mlb_team_id is None:
         print(f"[{team.label}] No MLB team id configured.")
         return None
 
-    today = datetime.datetime.now(ZoneInfo("America/New_York")).date()
+    today = datetime.datetime.now(LOCAL_TIMEZONE).date()
     url = (
         "https://statsapi.mlb.com/api/v1/schedule"
         f"?sportId={MLB_SPORT_ID}"
@@ -371,12 +429,12 @@ def get_mlb_game_info(team: TeamConfig):
     )
 
     try:
-        data = requests.get(url, timeout=10).json()
+        data = await fetch_json(url)
         games = []
         for date_entry in data.get("dates", []):
             games.extend(date_entry.get("games", []))
 
-        now = datetime.datetime.now(ZoneInfo("America/New_York"))
+        now = datetime.datetime.now(LOCAL_TIMEZONE)
         games.sort(key=lambda game: game.get("gameDate", ""))
 
         for game in games:
@@ -385,132 +443,94 @@ def get_mlb_game_info(team: TeamConfig):
                 continue
 
             game_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            game_time = game_time.astimezone(ZoneInfo("America/New_York"))
+            game_time = game_time.astimezone(LOCAL_TIMEZONE)
 
             status = game.get("status", {})
             detailed_state = status.get("detailedState", "Unknown")
             is_complete = status.get("abstractGameState") == "Final"
-            game_id = game.get("gamePk")
+            game_id = str(game.get("gamePk", ""))
             teams = game.get("teams", {})
             away_name = teams.get("away", {}).get("team", {}).get("name", "Away")
             home_name = teams.get("home", {}).get("team", {}).get("name", "Home")
 
             if game_time > now - datetime.timedelta(hours=6):
-                return {
-                    "time": game_time,
-                    "name": f"{away_name} at {home_name}",
-                    "id": str(game_id),
-                    "completed": is_complete,
-                    "status": detailed_state,
-                }
+                return Game(
+                    id=game_id,
+                    name=f"{away_name} at {home_name}",
+                    time=game_time,
+                    completed=is_complete,
+                    status=detailed_state,
+                )
 
     except Exception as e:
         print(f"[{team.label}] Error fetching MLB schedule: {e}")
 
     return None
 
-async def flash_score(bulb, points, team: TeamConfig):
-    """Flash the light to indicate a score.
-    
-    Args:
-        bulb: The Kasa bulb instance
-        points: Number of points scored (3 for field goal, 6 for TD, etc.)
-    """
-    if not bulb or points <= 0:
-        print(f"[{team.label}] Invalid bulb or points")
-        return
-        
-    light_module = bulb.modules.get(Module.Light)
-    if not light_module:
-        print(f"[{team.label}] No light module found")
-        return
-    
-    try:
-        # Get current color state from the bulb using modern Module syntax
-        await bulb.update()  # Refresh bulb state
-        light_state = bulb.modules[Module.Light]
-                
-        # Flash for each point (1 second on, 0.5 seconds off between flashes)
-        for i in range(points):
-            # Turn off
-            await bulb.turn_off()
-            await asyncio.sleep(0.5)
-            # Turn on with current color
-            await bulb.turn_on()
-            await asyncio.sleep(0.5)
-                
-    except Exception as e:
-        print(f"[{team.label}] Error during flash sequence: {e}")
-        # Try to restore original state on error
-        try:
-            await light_module.set_hsv(*team.color)
-        except:
-            pass
 
-async def wait_for_game_end(team: TeamConfig, game_id):
+async def wait_for_game_end(team: TeamConfig, game_id: str):
     """Polls the API to monitor game status and scores."""
     print(f"[{team.label}] Monitoring game {game_id}...")
 
     if team.provider == MLB_PROVIDER:
         await wait_for_mlb_game_end(team, game_id)
-        return
+    else:
+        await wait_for_espn_game_end(team, game_id)
 
-    await wait_for_espn_game_end(team, game_id)
 
-
-async def wait_for_espn_game_end(team: TeamConfig, game_id):
+async def wait_for_espn_game_end(team: TeamConfig, game_id: str):
     """Poll the ESPN summary endpoint for live game status and score changes."""
     url = (
-        f"http://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/summary?event={game_id}"
+        f"https://site.api.espn.com/apis/site/v2/sports/{team.sport_path}/summary?event={game_id}"
     )
-    last_score = 0
+    last_score = None
     bulb = None
-    
+
     try:
         bulb = await get_bulb()
     except Exception as e:
-        print(f"Could not connect to bulb: {e}")
-    
+        print(f"[{team.label}] Could not connect to bulb on attach: {e}")
+
     while True:
         try:
-            data = requests.get(url, timeout=10).json()
-            header = data.get('header', {})
-            competitions = header.get('competitions', [])
+            data = await fetch_json(url)
+            header = data.get("header", {})
+            competitions = header.get("competitions", [])
             if not competitions:
-                print("API Warning: No competition data found. Retrying...")
+                print(f"[{team.label}] API Warning: No competition data found. Retrying...")
                 await asyncio.sleep(60)
                 continue
-                
+
             competition = competitions[0]
-            status = competition.get('status', {})
-            completed = status.get('type', {}).get('completed', False)
-            
+            status = competition.get("status", {})
+            completed = status.get("type", {}).get("completed", False)
+
             # Check for score changes
-            for competitor in competition.get('competitors', []):
-                if competitor.get('id') == team.espn_team_id:
-                    current_score = int(competitor.get('score', '0'))
-                    if current_score > last_score:
+            for competitor in competition.get("competitors", []):
+                if competitor.get("id") == team.espn_team_id:
+                    current_score = int(competitor.get("score", "0"))
+                    if last_score is None:
+                        last_score = current_score
+                        print(
+                            f"[{team.label}] ESPN live monitor attached at current score {current_score}."
+                        )
+                    elif current_score > last_score:
                         points_scored = current_score - last_score
                         print(
                             f"[{team.label}] Scored {points_scored} points! New score: {current_score}"
                         )
-                        await flash_score(bulb, points_scored, team)
+                        await flash_score(points_scored, team, bulb)
                         last_score = current_score
                     break
-            
+
             if completed:
                 print(f"[{team.label}] API reports game is FINAL.")
                 return
-            
-            # period = status.get('type', {}).get('detail', 'In Progress')
-            # print(
-            #     f"[{team.label}] Game status: {period}, Score: {last_score}. Checking again in 10 seconds..."
-            # )
-            
+
         except Exception as e:
             print(f"[{team.label}] Error checking game status: {e}")
-        
-        await asyncio.sleep(10)  # Check more frequently for scores
+
+        await asyncio.sleep(10)
 
 
 def get_mlb_team_side(feed_data, team: TeamConfig):
@@ -555,7 +575,7 @@ def is_mlb_game_complete(feed_data):
     return abstract_state == "Final" or coded_state == "F"
 
 
-async def wait_for_mlb_game_end(team: TeamConfig, game_id):
+async def wait_for_mlb_game_end(team: TeamConfig, game_id: str):
     """Poll the MLB live feed for Orioles score changes and game completion."""
     url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
     last_score = None
@@ -564,11 +584,11 @@ async def wait_for_mlb_game_end(team: TeamConfig, game_id):
     try:
         bulb = await get_bulb()
     except Exception as e:
-        print(f"Could not connect to bulb: {e}")
+        print(f"[{team.label}] Could not connect to bulb on attach: {e}")
 
     while True:
         try:
-            data = requests.get(url, timeout=10).json()
+            data = await fetch_json(url)
             current_score = get_mlb_team_score(data, team)
             if last_score is None:
                 last_score = current_score
@@ -580,7 +600,7 @@ async def wait_for_mlb_game_end(team: TeamConfig, game_id):
                 print(
                     f"[{team.label}] Scored {runs_scored} run(s)! New score: {current_score}"
                 )
-                await flash_score(bulb, runs_scored, team)
+                await flash_score(runs_scored, team, bulb)
                 last_score = current_score
 
             if is_mlb_game_complete(data):
@@ -592,71 +612,60 @@ async def wait_for_mlb_game_end(team: TeamConfig, game_id):
 
         await asyncio.sleep(10)
 
-async def test_flash(team: TeamConfig = TEAM_CONFIGS[0]):
-    bulb = await get_bulb()
-    await bulb.modules[Module.Light].set_hsv(*team.color)
-    await flash_score(bulb, 6, team)
-
 
 async def monitor_team(team: TeamConfig):
     """Continuously monitor the team's schedule and drive the light behavior."""
     print(f"[{team.label}] Starting light automation...")
-    
+
     while True:
-        game = get_game_info(team)
-        
+        game = await get_game_info(team)
+
         if not game:
             print(f"[{team.label}] No upcoming games found. Sleeping for 24 hours...")
             await asyncio.sleep(86400)
             continue
 
-        now = datetime.datetime.now(ZoneInfo('America/New_York'))
-        game_time = game['time']
-        trigger_time = game_time - datetime.timedelta(minutes=5)
+        now = datetime.datetime.now(LOCAL_TIMEZONE)
+        trigger_time = game.time - datetime.timedelta(minutes=5)
         wait_seconds = (trigger_time - now).total_seconds()
 
-        print(f"[{team.label}] Target Game: {game['name']}")
-        print(f"[{team.label}] Start: {game_time.strftime('%Y-%m-%d %H:%M:%S')} ET")
+        print(f"[{team.label}] Target Game: {game.name}")
+        print(f"[{team.label}] Start: {game.time.strftime('%Y-%m-%d %H:%M:%S')} ET")
 
-        # --- Scenario 1: Game is in the future ---
+        # Game is in the future
         if wait_seconds > 0:
+            if wait_seconds > MAX_SCHEDULE_SLEEP_SECONDS:
+                print(
+                    f"[{team.label}] Game is in {wait_seconds/3600:.1f} hours. "
+                    f"Sleeping {MAX_SCHEDULE_SLEEP_SECONDS/3600:.1f} hours before next schedule check..."
+                )
+                await asyncio.sleep(MAX_SCHEDULE_SLEEP_SECONDS)
+                continue
+
             print(
                 f"[{team.label}] Waiting {wait_seconds/60:.1f} minutes until start trigger..."
             )
             await asyncio.sleep(wait_seconds)
 
+        # Game is starting or in progress
+        if not game.completed:
+            print(f"[{team.label}] Game active! Setting team color.")
             await turn_on_team_color(team)
             try:
-                await wait_for_game_end(team, game['id'])
+                await wait_for_game_end(team, game.id)
             finally:
                 await set_post_game_light(team)
 
             await asyncio.sleep(3600)
-
-        # --- Scenario 2: Game started (or script restarted during game) ---
-        elif wait_seconds <= 0 and not game['completed']:
-            print(f"[{team.label}] Game in progress! Turning team color immediately.")
-
-            await turn_on_team_color(team)
-            try:
-                await wait_for_game_end(team, game['id'])
-            finally:
-                await set_post_game_light(team)
-
-            await asyncio.sleep(3600)
-
-        # --- Scenario 3: Old game found ---
         else:
-            print(f"[{team.label}] Found a game, but it is Final. Skipping...")
+            print(f"[{team.label}] Found game is already Final. Checking again in 1 hour...")
             await asyncio.sleep(3600)
+
 
 async def main():
-#    await turn_on_team_color(TEAM_CONFIGS[0])
-#    await set_post_game_light(TEAM_CONFIGS[0])
-
     validate_team_configs()
-
     await asyncio.gather(*(monitor_team(team) for team in TEAM_CONFIGS))
+
 
 if __name__ == "__main__":
     asyncio.run(main())
