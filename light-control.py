@@ -521,6 +521,11 @@ async def wait_for_espn_game_end(team: TeamConfig, game_id: str):
                         )
                         await flash_score(points_scored, team, bulb)
                         last_score = current_score
+                    elif current_score < last_score:
+                        print(
+                            f"[{team.label}] Score decreased from {last_score} to {current_score} (e.g. overturned/stat correction)."
+                        )
+                        last_score = current_score
                     break
 
             if completed:
@@ -601,6 +606,11 @@ async def wait_for_mlb_game_end(team: TeamConfig, game_id: str):
                     f"[{team.label}] Scored {runs_scored} run(s)! New score: {current_score}"
                 )
                 await flash_score(runs_scored, team, bulb)
+                last_score = current_score
+            elif current_score < last_score:
+                print(
+                    f"[{team.label}] Score decreased from {last_score} to {current_score} (e.g. overturned/stat correction)."
+                )
                 last_score = current_score
 
             if is_mlb_game_complete(data):
