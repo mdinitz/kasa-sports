@@ -58,6 +58,8 @@ class Game:
     time: datetime.datetime
     completed: bool
     status: str = ""
+    is_delayed_start: bool = False
+    is_postponed: bool = False
 
 
 TEAM_CONFIGS = (
@@ -287,6 +289,26 @@ async def turn_on_team_color(team: TeamConfig):
             print(f"[{team.label}] Failed to set team color: {e}")
 
 
+async def turn_off_if_team_color(team: TeamConfig):
+    """Turn off the bulb if it is currently turned on to the team's color."""
+    async with BULB_LOCK:
+        try:
+            bulb = await get_bulb()
+            if bulb.is_on:
+                light = bulb.modules.get(Module.Light)
+                if light and getattr(light, "color_temp", 0) == 0 and hasattr(light, "hsv"):
+                    h, s, v = light.hsv
+                    th, ts, tv = team.color
+                    # Match hue within 10 degrees and saturation within 15%
+                    if abs(h - th) <= 10 and abs(s - ts) <= 15:
+                        print(
+                            f"[{team.label}] Bulb is showing team color during delay; turning off."
+                        )
+                        await bulb.turn_off()
+        except Exception as e:
+            print(f"[{team.label}] Note: Could not check/turn off bulb during delay: {e}")
+
+
 async def set_post_game_light(team: TeamConfig):
     """Set the bulb to soft white after a game ends, with sunset-based brightness."""
     brightness, sunset = get_post_game_brightness()
@@ -394,16 +416,45 @@ async def get_espn_game_info(team: TeamConfig) -> Optional[Game]:
             if not competitions:
                 continue
 
-            status = competitions[0].get("status", {})
-            is_complete = status.get("type", {}).get("completed", False)
+            status_obj = competitions[0].get("status", {})
+            status_type = status_obj.get("type", {})
+            type_name = status_type.get("name", "")
+            state = status_type.get("state", "")
+            description = status_type.get("description", "")
+            detail = status_type.get("detail", "")
+            desc_lower = f"{type_name} {description} {detail}".lower()
+
+            is_postponed = (
+                "postponed" in desc_lower
+                or "cancel" in desc_lower
+                or "suspended" in desc_lower
+                or type_name in ("STATUS_POSTPONED", "STATUS_CANCELED")
+            )
+            is_complete = (
+                status_type.get("completed", False)
+                or state == "post"
+                or type_name == "STATUS_FINAL"
+                or is_postponed
+            )
+            is_delayed_start = (
+                state == "pre"
+                and ("delayed" in desc_lower or type_name == "STATUS_DELAYED")
+            )
+
+            if is_complete:
+                continue
+
             game_id = str(event.get("id", ""))
 
-            if game_time > now - datetime.timedelta(hours=6):
+            if game_time > now - datetime.timedelta(hours=12):
                 return Game(
                     id=game_id,
                     name=event.get("name", "Unknown Game"),
                     time=game_time,
                     completed=is_complete,
+                    status=description or type_name,
+                    is_delayed_start=is_delayed_start,
+                    is_postponed=is_postponed,
                 )
 
     except Exception as e:
@@ -447,19 +498,45 @@ async def get_mlb_game_info(team: TeamConfig) -> Optional[Game]:
 
             status = game.get("status", {})
             detailed_state = status.get("detailedState", "Unknown")
-            is_complete = status.get("abstractGameState") == "Final"
+            abstract_state = status.get("abstractGameState", "")
+            coded_state = status.get("codedGameState", "")
+            status_code = status.get("statusCode", "")
+            detailed_lower = detailed_state.lower()
+
+            is_postponed = (
+                coded_state in ("D", "C")
+                or "postponed" in detailed_lower
+                or "cancel" in detailed_lower
+                or "suspended" in detailed_lower
+            )
+            is_complete = (
+                abstract_state == "Final"
+                or coded_state in ("F", "O")
+                or is_postponed
+            )
+            is_delayed_start = (
+                status_code == "PI"
+                or "delayed start" in detailed_lower
+                or (abstract_state == "Preview" and "delayed" in detailed_lower)
+            )
+
+            if is_complete:
+                continue
+
             game_id = str(game.get("gamePk", ""))
             teams = game.get("teams", {})
             away_name = teams.get("away", {}).get("team", {}).get("name", "Away")
             home_name = teams.get("home", {}).get("team", {}).get("name", "Home")
 
-            if game_time > now - datetime.timedelta(hours=6):
+            if game_time > now - datetime.timedelta(hours=12):
                 return Game(
                     id=game_id,
                     name=f"{away_name} at {home_name}",
                     time=game_time,
                     completed=is_complete,
                     status=detailed_state,
+                    is_delayed_start=is_delayed_start,
+                    is_postponed=is_postponed,
                 )
 
     except Exception as e:
@@ -502,8 +579,16 @@ async def wait_for_espn_game_end(team: TeamConfig, game_id: str):
                 continue
 
             competition = competitions[0]
-            status = competition.get("status", {})
-            completed = status.get("type", {}).get("completed", False)
+            status_obj = competition.get("status", {})
+            status_type = status_obj.get("type", {})
+            completed = status_type.get("completed", False)
+            type_name = status_type.get("name", "")
+            state = status_type.get("state", "")
+            is_done = (
+                completed
+                or state == "post"
+                or type_name in ("STATUS_FINAL", "STATUS_POSTPONED", "STATUS_CANCELED")
+            )
 
             # Check for score changes
             for competitor in competition.get("competitors", []):
@@ -528,8 +613,8 @@ async def wait_for_espn_game_end(team: TeamConfig, game_id: str):
                         last_score = current_score
                     break
 
-            if completed:
-                print(f"[{team.label}] API reports game is FINAL.")
+            if is_done:
+                print(f"[{team.label}] API reports game is FINAL / {type_name or 'completed'}.")
                 return
 
         except Exception as e:
@@ -575,9 +660,16 @@ def get_mlb_team_score(feed_data, team: TeamConfig):
 
 def is_mlb_game_complete(feed_data):
     status = feed_data.get("gameData", {}).get("status", {})
-    abstract_state = status.get("abstractGameState")
-    coded_state = status.get("codedGameState")
-    return abstract_state == "Final" or coded_state == "F"
+    abstract_state = status.get("abstractGameState", "")
+    coded_state = status.get("codedGameState", "")
+    detailed_state = status.get("detailedState", "").lower()
+    return (
+        abstract_state == "Final"
+        or coded_state in ("F", "O", "D", "C")
+        or "postponed" in detailed_state
+        or "cancel" in detailed_state
+        or "suspended" in detailed_state
+    )
 
 
 async def wait_for_mlb_game_end(team: TeamConfig, game_id: str):
@@ -614,7 +706,7 @@ async def wait_for_mlb_game_end(team: TeamConfig, game_id: str):
                 last_score = current_score
 
             if is_mlb_game_complete(data):
-                print(f"[{team.label}] MLB API reports game is FINAL.")
+                print(f"[{team.label}] MLB API reports game is FINAL / complete.")
                 return
 
         except Exception as e:
@@ -626,6 +718,8 @@ async def wait_for_mlb_game_end(team: TeamConfig, game_id: str):
 async def monitor_team(team: TeamConfig):
     """Continuously monitor the team's schedule and drive the light behavior."""
     print(f"[{team.label}] Starting light automation...")
+    last_delay_logged = None
+    turned_off_for_delay = False
 
     while True:
         game = await get_game_info(team)
@@ -635,41 +729,64 @@ async def monitor_team(team: TeamConfig):
             await asyncio.sleep(86400)
             continue
 
+        if game.completed or game.is_postponed:
+            print(
+                f"[{team.label}] Game {game.name} is {game.status or 'completed'}. "
+                f"Checking again in 1 hour..."
+            )
+            await asyncio.sleep(3600)
+            continue
+
         now = datetime.datetime.now(LOCAL_TIMEZONE)
         trigger_time = game.time - datetime.timedelta(minutes=5)
         wait_seconds = (trigger_time - now).total_seconds()
 
-        print(f"[{team.label}] Target Game: {game.name}")
-        print(f"[{team.label}] Start: {game.time.strftime('%Y-%m-%d %H:%M:%S')} ET")
-
         # Game is in the future
         if wait_seconds > 0:
+            last_delay_logged = None
+            turned_off_for_delay = False
+            print(f"[{team.label}] Target Game: {game.name}")
+            print(f"[{team.label}] Start: {game.time.strftime('%Y-%m-%d %H:%M:%S')} ET")
+
             if wait_seconds > MAX_SCHEDULE_SLEEP_SECONDS:
                 print(
                     f"[{team.label}] Game is in {wait_seconds/3600:.1f} hours. "
                     f"Sleeping {MAX_SCHEDULE_SLEEP_SECONDS/3600:.1f} hours before next schedule check..."
                 )
                 await asyncio.sleep(MAX_SCHEDULE_SLEEP_SECONDS)
-                continue
+            else:
+                print(
+                    f"[{team.label}] Waiting {wait_seconds/60:.1f} minutes until start trigger..."
+                )
+                await asyncio.sleep(wait_seconds)
+            continue
 
-            print(
-                f"[{team.label}] Waiting {wait_seconds/60:.1f} minutes until start trigger..."
-            )
-            await asyncio.sleep(wait_seconds)
+        # We are within 5 minutes of scheduled start or past scheduled start
+        if game.is_delayed_start:
+            if not turned_off_for_delay:
+                await turn_off_if_team_color(team)
+                turned_off_for_delay = True
+
+            if last_delay_logged != game.status:
+                print(
+                    f"[{team.label}] Game start is delayed: {game.status}. "
+                    f"Light will remain off. Waiting for game to start..."
+                )
+                last_delay_logged = game.status
+            await asyncio.sleep(60)
+            continue
 
         # Game is starting or in progress
-        if not game.completed:
-            print(f"[{team.label}] Game active! Setting team color.")
-            await turn_on_team_color(team)
-            try:
-                await wait_for_game_end(team, game.id)
-            finally:
-                await set_post_game_light(team)
+        last_delay_logged = None
+        turned_off_for_delay = False
+        print(f"[{team.label}] Game active! Setting team color.")
+        await turn_on_team_color(team)
+        try:
+            await wait_for_game_end(team, game.id)
+        finally:
+            await set_post_game_light(team)
 
-            await asyncio.sleep(3600)
-        else:
-            print(f"[{team.label}] Found game is already Final. Checking again in 1 hour...")
-            await asyncio.sleep(3600)
+        await asyncio.sleep(3600)
 
 
 async def main():
