@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Optional
 from zoneinfo import ZoneInfo
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from kasa import Module, KasaException
 from kasa.iot import IotBulb
 
@@ -19,6 +21,7 @@ LOCATION_LATITUDE = 39.2904
 LOCATION_LONGITUDE = -76.6122
 LOCAL_TIMEZONE = ZoneInfo("America/New_York")
 MAX_SCHEDULE_SLEEP_SECONDS = 7200
+SCHEDULE_ERROR_RETRY_SECONDS = 60
 
 # Game On: Purple (Hue 280, Sat 100, Val 100)
 RAVENS_COLOR = (280, 100, 100)
@@ -35,7 +38,24 @@ MLB_PROVIDER = "mlb"
 MLB_SPORT_ID = 1
 MLB_GAME_TYPES = ("S", "R", "F", "D", "L", "W")
 
-HTTP_SESSION = requests.Session()
+
+def create_http_session() -> requests.Session:
+    """Create a requests session with automatic retry on transient network errors."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+HTTP_SESSION = create_http_session()
 HTTP_TIMEOUT = 10
 BULB_LOCK = asyncio.Lock()
 
@@ -384,81 +404,84 @@ async def get_espn_game_info(team: TeamConfig) -> Optional[Game]:
         f"{base_url}?seasontype=3",  # Postseason / playoffs / bowl games
     ]
 
-    try:
-        events = []
-        seen_event_ids = set()
+    events = []
+    seen_event_ids = set()
+    successful_fetches = 0
+    last_exception = None
 
-        for url in urls:
-            try:
-                data = await fetch_json(url)
-                for event in data.get("events", []):
-                    event_id = event.get("id")
-                    if event_id and event_id in seen_event_ids:
-                        continue
-                    if event_id:
-                        seen_event_ids.add(event_id)
-                    events.append(event)
-            except Exception as e:
-                print(f"[{team.label}] Warning fetching schedule from {url}: {e}")
+    for url in urls:
+        try:
+            data = await fetch_json(url)
+            successful_fetches += 1
+            for event in data.get("events", []):
+                event_id = event.get("id")
+                if event_id and event_id in seen_event_ids:
+                    continue
+                if event_id:
+                    seen_event_ids.add(event_id)
+                events.append(event)
+        except Exception as e:
+            last_exception = e
+            print(f"[{team.label}] Warning fetching schedule from {url}: {e}")
 
-        events.sort(key=lambda event: event.get("date", ""))
-        now = datetime.datetime.now(LOCAL_TIMEZONE)
+    if successful_fetches == 0 and last_exception:
+        raise RuntimeError(f"Failed to fetch ESPN schedule: {last_exception}") from last_exception
 
-        for event in events:
-            date_str = event.get("date")
-            if not date_str:
-                continue
+    events.sort(key=lambda event: event.get("date", ""))
+    now = datetime.datetime.now(LOCAL_TIMEZONE)
 
-            game_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            game_time = game_time.astimezone(LOCAL_TIMEZONE)
+    for event in events:
+        date_str = event.get("date")
+        if not date_str:
+            continue
 
-            competitions = event.get("competitions", [])
-            if not competitions:
-                continue
+        game_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        game_time = game_time.astimezone(LOCAL_TIMEZONE)
 
-            status_obj = competitions[0].get("status", {})
-            status_type = status_obj.get("type", {})
-            type_name = status_type.get("name", "")
-            state = status_type.get("state", "")
-            description = status_type.get("description", "")
-            detail = status_type.get("detail", "")
-            desc_lower = f"{type_name} {description} {detail}".lower()
+        competitions = event.get("competitions", [])
+        if not competitions:
+            continue
 
-            is_postponed = (
-                "postponed" in desc_lower
-                or "cancel" in desc_lower
-                or "suspended" in desc_lower
-                or type_name in ("STATUS_POSTPONED", "STATUS_CANCELED")
+        status_obj = competitions[0].get("status", {})
+        status_type = status_obj.get("type", {})
+        type_name = status_type.get("name", "")
+        state = status_type.get("state", "")
+        description = status_type.get("description", "")
+        detail = status_type.get("detail", "")
+        desc_lower = f"{type_name} {description} {detail}".lower()
+
+        is_postponed = (
+            "postponed" in desc_lower
+            or "cancel" in desc_lower
+            or "suspended" in desc_lower
+            or type_name in ("STATUS_POSTPONED", "STATUS_CANCELED")
+        )
+        is_complete = (
+            status_type.get("completed", False)
+            or state == "post"
+            or type_name == "STATUS_FINAL"
+            or is_postponed
+        )
+        is_delayed_start = (
+            state == "pre"
+            and ("delayed" in desc_lower or type_name == "STATUS_DELAYED")
+        )
+
+        if is_complete:
+            continue
+
+        game_id = str(event.get("id", ""))
+
+        if game_time > now - datetime.timedelta(hours=12):
+            return Game(
+                id=game_id,
+                name=event.get("name", "Unknown Game"),
+                time=game_time,
+                completed=is_complete,
+                status=description or type_name,
+                is_delayed_start=is_delayed_start,
+                is_postponed=is_postponed,
             )
-            is_complete = (
-                status_type.get("completed", False)
-                or state == "post"
-                or type_name == "STATUS_FINAL"
-                or is_postponed
-            )
-            is_delayed_start = (
-                state == "pre"
-                and ("delayed" in desc_lower or type_name == "STATUS_DELAYED")
-            )
-
-            if is_complete:
-                continue
-
-            game_id = str(event.get("id", ""))
-
-            if game_time > now - datetime.timedelta(hours=12):
-                return Game(
-                    id=game_id,
-                    name=event.get("name", "Unknown Game"),
-                    time=game_time,
-                    completed=is_complete,
-                    status=description or type_name,
-                    is_delayed_start=is_delayed_start,
-                    is_postponed=is_postponed,
-                )
-
-    except Exception as e:
-        print(f"[{team.label}] Error fetching ESPN schedule: {e}")
 
     return None
 
@@ -479,68 +502,64 @@ async def get_mlb_game_info(team: TeamConfig) -> Optional[Game]:
         f"&gameTypes={','.join(MLB_GAME_TYPES)}"
     )
 
-    try:
-        data = await fetch_json(url)
-        games = []
-        for date_entry in data.get("dates", []):
-            games.extend(date_entry.get("games", []))
+    data = await fetch_json(url)
+    games = []
+    for date_entry in data.get("dates", []):
+        games.extend(date_entry.get("games", []))
 
-        now = datetime.datetime.now(LOCAL_TIMEZONE)
-        games.sort(key=lambda game: game.get("gameDate", ""))
+    now = datetime.datetime.now(LOCAL_TIMEZONE)
+    games.sort(key=lambda game: game.get("gameDate", ""))
 
-        for game in games:
-            date_str = game.get("gameDate")
-            if not date_str:
-                continue
+    for game in games:
+        date_str = game.get("gameDate")
+        if not date_str:
+            continue
 
-            game_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            game_time = game_time.astimezone(LOCAL_TIMEZONE)
+        game_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        game_time = game_time.astimezone(LOCAL_TIMEZONE)
 
-            status = game.get("status", {})
-            detailed_state = status.get("detailedState", "Unknown")
-            abstract_state = status.get("abstractGameState", "")
-            coded_state = status.get("codedGameState", "")
-            status_code = status.get("statusCode", "")
-            detailed_lower = detailed_state.lower()
+        status = game.get("status", {})
+        detailed_state = status.get("detailedState", "Unknown")
+        abstract_state = status.get("abstractGameState", "")
+        coded_state = status.get("codedGameState", "")
+        status_code = status.get("statusCode", "")
+        detailed_lower = detailed_state.lower()
 
-            is_postponed = (
-                coded_state in ("D", "C")
-                or "postponed" in detailed_lower
-                or "cancel" in detailed_lower
-                or "suspended" in detailed_lower
+        is_postponed = (
+            coded_state in ("D", "C")
+            or "postponed" in detailed_lower
+            or "cancel" in detailed_lower
+            or "suspended" in detailed_lower
+        )
+        is_complete = (
+            abstract_state == "Final"
+            or coded_state in ("F", "O")
+            or is_postponed
+        )
+        is_delayed_start = (
+            status_code == "PI"
+            or "delayed start" in detailed_lower
+            or (abstract_state == "Preview" and "delayed" in detailed_lower)
+        )
+
+        if is_complete:
+            continue
+
+        game_id = str(game.get("gamePk", ""))
+        teams = game.get("teams", {})
+        away_name = teams.get("away", {}).get("team", {}).get("name", "Away")
+        home_name = teams.get("home", {}).get("team", {}).get("name", "Home")
+
+        if game_time > now - datetime.timedelta(hours=12):
+            return Game(
+                id=game_id,
+                name=f"{away_name} at {home_name}",
+                time=game_time,
+                completed=is_complete,
+                status=detailed_state,
+                is_delayed_start=is_delayed_start,
+                is_postponed=is_postponed,
             )
-            is_complete = (
-                abstract_state == "Final"
-                or coded_state in ("F", "O")
-                or is_postponed
-            )
-            is_delayed_start = (
-                status_code == "PI"
-                or "delayed start" in detailed_lower
-                or (abstract_state == "Preview" and "delayed" in detailed_lower)
-            )
-
-            if is_complete:
-                continue
-
-            game_id = str(game.get("gamePk", ""))
-            teams = game.get("teams", {})
-            away_name = teams.get("away", {}).get("team", {}).get("name", "Away")
-            home_name = teams.get("home", {}).get("team", {}).get("name", "Home")
-
-            if game_time > now - datetime.timedelta(hours=12):
-                return Game(
-                    id=game_id,
-                    name=f"{away_name} at {home_name}",
-                    time=game_time,
-                    completed=is_complete,
-                    status=detailed_state,
-                    is_delayed_start=is_delayed_start,
-                    is_postponed=is_postponed,
-                )
-
-    except Exception as e:
-        print(f"[{team.label}] Error fetching MLB schedule: {e}")
 
     return None
 
@@ -722,7 +741,15 @@ async def monitor_team(team: TeamConfig):
     turned_off_for_delay = False
 
     while True:
-        game = await get_game_info(team)
+        try:
+            game = await get_game_info(team)
+        except Exception as e:
+            print(
+                f"[{team.label}] Error fetching schedule: {e}. "
+                f"Retrying in {SCHEDULE_ERROR_RETRY_SECONDS} seconds..."
+            )
+            await asyncio.sleep(SCHEDULE_ERROR_RETRY_SECONDS)
+            continue
 
         if not game:
             print(f"[{team.label}] No upcoming games found. Sleeping for 24 hours...")
