@@ -22,6 +22,7 @@ LOCATION_LONGITUDE = -76.6122
 LOCAL_TIMEZONE = ZoneInfo("America/New_York")
 MAX_SCHEDULE_SLEEP_SECONDS = 7200
 SCHEDULE_ERROR_RETRY_SECONDS = 60
+POST_GAME_WAIT_SECONDS = 300
 
 # Game On: Purple (Hue 280, Sat 100, Val 100)
 RAVENS_COLOR = (280, 100, 100)
@@ -813,8 +814,8 @@ async def monitor_team(team: TeamConfig):
         finally:
             await set_post_game_light(team)
 
-        # Short pause after game ends before checking schedule for next game (e.g. doubleheaders)
-        await asyncio.sleep(10)
+        # Wait after game ends before checking schedule for next game (e.g. doubleheaders)
+        await asyncio.sleep(POST_GAME_WAIT_SECONDS)
 
 
 async def main():
