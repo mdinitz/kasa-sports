@@ -813,7 +813,8 @@ async def monitor_team(team: TeamConfig):
         finally:
             await set_post_game_light(team)
 
-        await asyncio.sleep(3600)
+        # Short pause after game ends before checking schedule for next game (e.g. doubleheaders)
+        await asyncio.sleep(10)
 
 
 async def main():
